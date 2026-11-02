@@ -1,173 +1,310 @@
-import altair as alt
+# `math` fornece funções matemáticas; aqui usamos `ceil` para arredondar
+# para cima a quantidade de linhas necessárias na grade de histogramas.
+import math
+
+# `pandas` manipula dados tabulares (DataFrames), como o CSV deste projeto.
 import pandas as pd
+
+# `graph_objects` permite montar gráficos Plotly configurando cada elemento.
+import plotly.graph_objects as go
+
+# `streamlit` fornece os componentes da página, os filtros e a exibição dos gráficos.
 import streamlit as st
 
+# `make_subplots` cria uma figura com vários gráficos menores organizados em grade.
+from plotly.subplots import make_subplots
+
+# Função do projeto que lê o CSV e o devolve como um DataFrame do pandas.
 from src.data_loader import load_data
 
+# Define configurações gerais da página. Deve ser chamado antes de outros
+# comandos de interface do Streamlit.
 st.set_page_config(
-    page_title="Avaliação de Correlação entre Variáveis Quantitativas do Heart Disease Dataset",
-    layout="wide",
+    page_title="Acidentes de trânsito: distribuição e correlação",
+    page_icon=":material/traffic:",
+    layout="wide",  # Usa a largura disponível, útil para exibir gráficos lado a lado.
 )
 
-st.title("Avaliação de Correlação entre Variáveis Quantitativas do Heart Disease Dataset")
+# Lista das colunas numéricas que podem ser selecionadas na barra lateral.
+# Os nomes precisam corresponder exatamente aos cabeçalhos do arquivo CSV.
+VARIAVEIS = [
+    "Hour",
+    "Month",
+    "Is_Holiday",
+    "Speed_Limit_kmh",
+    "Visibility_m",
+    "Congestion_Index",
+    "Driver_Age",
+    "Driver_Experience_yrs",
+    "Vehicle_Age_yrs",
+    "Recorded_Speed_kmh",
+    "Baseline_Expected_Response_Time_min",
+    "Vehicles_Involved",
+    "Actual_Response_Time_min",
+    "Road_Closure_Duration_min",
+    "congestion_log",
+]
 
+# Carrega os dados. No `data_loader.py`, `load_data()` usa `pandas.read_csv`
+# para abrir `data/clean/dataset.csv` e retornar o conteúdo como DataFrame.
 df = load_data()
 
-# Variáveis quantitativas do estudo (mesma lista VARS_QUANT do notebook de EDA)
-VARS_QUANT = ["age", "trestbps", "chol", "thalach", "oldpeak"]
+# Primeiro, verifica se todas as colunas pedidas existem no DataFrame.
+# A expressão `x not in df.columns` testa se o nome da coluna está ausente;
+# a compreensão de lista reúne todos os nomes ausentes em uma nova lista.
+colunas_ausentes = [variavel for variavel in VARIAVEIS if variavel not in df.columns]
+if colunas_ausentes:
+    # `st.error` mostra um aviso de erro no app e `st.stop` interrompe a execução
+    # deste rerun para evitar que o restante do código use colunas inexistentes.
+    st.error(f"Colunas necessárias não encontradas no dataset: {', '.join(colunas_ausentes)}")
+    st.stop()
 
-# Sidebar: filtros (variáveis + intervalo)
+# Os histogramas e a correlação exigem números. `is_numeric_dtype` verifica
+# se uma coluna tem um tipo numérico reconhecido pelo pandas.
+colunas_nao_numericas = [
+    variavel
+    for variavel in VARIAVEIS
+    if not pd.api.types.is_numeric_dtype(df[variavel])
+]
+if colunas_nao_numericas:
+    # Falha explicitamente caso uma coluna numérica tenha sido lida como texto.
+    st.error(
+        "As seguintes colunas precisam conter valores numéricos: "
+        f"{', '.join(colunas_nao_numericas)}"
+    )
+    st.stop()
+
+# Título e texto de orientação na área principal do dashboard.
+st.title("Análise de acidentes de trânsito")
+st.caption(
+    "Explore a distribuição das variáveis e a correlação entre elas. "
+    "Use os filtros na barra lateral para definir a análise."
+)
+
+# O bloco `with st.sidebar` coloca todos os elementos indentados na barra lateral.
+# Ao alterar um widget, o Streamlit executa o script novamente e atualiza os gráficos.
 with st.sidebar:
     st.header("Filtros")
 
-    variaveis = st.multiselect(
-        "Variáveis Quantitativas",
-        options=VARS_QUANT,
-        default=VARS_QUANT,
-        help="Selecione as variáveis quantitativas que deseja analisar no dashboard.",
+    # `st.multiselect` permite escolher zero, uma ou várias opções.
+    # `options` define as escolhas possíveis; `default` marca inicialmente
+    # todas as variáveis como selecionadas.
+    variaveis_selecionadas = st.multiselect(
+        "Variáveis para análise",
+        options=VARIAVEIS,
+        default=VARIAVEIS,
+        help="As variáveis selecionadas aparecem nos histogramas e no mapa de correlação.",
     )
 
-    separar_por_classe = st.toggle(
-        "Distinguir por Classe",
-        value=False,
-        help="Colore a distribuição pela classe (doenca_cardiaca: Normal ou Cardíaco).",
-    )
-
-    # Um slider de intervalo para cada variável selecionada
+    # Dicionário para guardar cada intervalo escolhido no formato
+    # {nome_da_coluna: (limite_inicial, limite_final)}.
     intervalos = {}
-    for var in variaveis:
-        if pd.api.types.is_integer_dtype(df[var]):
-            minimo, maximo, passo = int(df[var].min()), int(df[var].max()), 1
-        else:
-            minimo, maximo, passo = float(df[var].min()), float(df[var].max()), 0.1
-        intervalos[var] = st.slider(
-            f"Intervalo de {var}",
-            min_value=minimo,
-            max_value=maximo,
-            value=(minimo, maximo),
-            step=passo,
-            key=f"intervalo_{var}",
-        )
+    if variaveis_selecionadas:
+        st.subheader("Intervalos")
+        for variavel in variaveis_selecionadas:
+            # `dropna()` cria uma série sem valores ausentes (NaN).
+            # Isso evita tentar calcular os limites usando valores vazios.
+            valores_validos = df[variavel].dropna()
+            if valores_validos.empty:
+                st.warning(f"A variável {variavel} não possui valores disponíveis.")
+                continue
 
-# Mantém só os pacientes dentro de todos os intervalos escolhidos
-df_filtrado = df
-for var, (inicio, fim) in intervalos.items():
-    df_filtrado = df_filtrado[df_filtrado[var].between(inicio, fim)]
+            # `min()` e `max()` encontram os extremos observados da coluna.
+            minimo = valores_validos.min()
+            maximo = valores_validos.max()
 
-st.caption(f"{len(df_filtrado)} de {len(df)} pacientes dentro dos intervalos escolhidos.")
+            # Se todos os registros têm o mesmo valor, não há faixa para escolher.
+            # Guardamos o próprio valor como intervalo para manter o filtro consistente.
+            if minimo == maximo:
+                st.caption(f"{variavel}: valor fixo {minimo}")
+                intervalos[variavel] = (minimo, maximo)
+            # `is_integer_dtype` verifica se a coluna usa números inteiros.
+            # Nesse caso, o controle deslizante avança de um número inteiro por vez.
+            elif pd.api.types.is_integer_dtype(df[variavel]):
+                # `st.slider` cria um controle de faixa quando `value` recebe
+                # uma tupla (menor, maior). O usuário escolhe os dois limites.
+                intervalos[variavel] = st.slider(
+                    variavel,
+                    min_value=int(minimo),
+                    max_value=int(maximo),
+                    value=(int(minimo), int(maximo)),
+                    step=1,
+                    key=f"intervalo_{variavel}",
+                )
+            else:
+                # Para dados decimais, convertemos os limites para `float`.
+                # A variável `passo` define o tamanho dos incrementos do slider:
+                # aproximadamente 1% da amplitude, com mínimo de 0,01.
+                minimo_float = float(minimo)
+                maximo_float = float(maximo)
+                intervalos[variavel] = st.slider(
+                    variavel,
+                    min_value=minimo_float,
+                    max_value=maximo_float,
+                    value=(minimo_float, maximo_float),
+                    step=max((maximo_float - minimo_float) / 100, 0.01),
+                    key=f"intervalo_{variavel}",
+                )
 
-# Dashboard 1: correlação (heatmap) à esquerda, distribuição (histograma) à direita
-col_correlacao, col_distribuicao = st.columns([1, 1.5])
+# Aplica os filtros aos dados antes de desenhar os gráficos.
+# `copy()` cria uma cópia do DataFrame original para que os filtros não alterem `df`.
+df_filtrado = df.copy()
 
-# Cores do histograma, em tons de sangue: vermelho arterial para Cardíaco, rosa claro para Normal
-COR_NORMAL = "#f4a6a6"
-COR_CARDIACO = "#c1121f"
-COR_HISTOGRAMA = COR_CARDIACO
-CORES_CLASSE = alt.Scale(domain=["Normal", "Cardíaco"], range=[COR_NORMAL, COR_CARDIACO])
+# `intervalos.items()` percorre os pares (nome da coluna, faixa escolhida).
+# `between(inicio, fim)` retorna True para cada linha cujo valor está na faixa,
+# incluindo os extremos. Usamos essa sequência de True/False para manter as linhas
+# correspondentes no DataFrame.
+for variavel, (inicio, fim) in intervalos.items():
+    df_filtrado = df_filtrado[df_filtrado[variavel].between(inicio, fim)]
 
-# Legenda das classes em texto, para caber no espaço livre da grade de histogramas
-LEGENDA_CLASSE = (
-    f"**Classe**  \n"
-    f":color[■]{{foreground=\"{COR_NORMAL}\"}} Normal  \n"
-    f":color[■]{{foreground=\"{COR_CARDIACO}\"}} Cardíaco"
+# `len()` conta as linhas. `:,` no texto formata a contagem com separador
+# de milhar, facilitando a leitura de números grandes.
+st.caption(
+    f"{len(df_filtrado):,} de {len(df):,} registros dentro dos intervalos selecionados."
 )
 
-with col_correlacao:
-    st.subheader("Correlação (Spearman)")
+# `st.columns` divide a área principal em colunas. Os valores [1.25, 1]
+# definem a proporção de largura: a área de histogramas fica um pouco maior.
+coluna_distribuicao, coluna_correlacao = st.columns([1.25, 1])
 
-    if len(variaveis) < 2:
-        st.warning("Selecione pelo menos 2 variáveis para calcular a correlação.")
-    elif len(df_filtrado) < 30:
-        st.warning("Poucos pacientes nos intervalos escolhidos para calcular a correlação.")
-    else:
-        # Matriz de correlação de Spearman das variáveis selecionadas, em formato longo (uma linha por célula)
-        corr = (
-            df_filtrado[variaveis]
-            .corr(method="spearman")
-            .rename_axis(index="var_y", columns="var_x")
-            .stack()
-            .rename("correlacao")
-            .reset_index()
-        )
-        # Só o triângulo inferior, sem a diagonal (sempre 1): a matriz é simétrica, o resto é repetição
-        ordem = {var: i for i, var in enumerate(variaveis)}
-        corr = corr[corr["var_y"].map(ordem) > corr["var_x"].map(ordem)]
+# Matriz de histogramas: cada histograma agrupa os valores em faixas (bins)
+# e conta quantos registros caem em cada faixa, mostrando a distribuição.
+# `with coluna_distribuicao` direciona os componentes seguintes para essa coluna.
+with coluna_distribuicao:
+    st.subheader("Distribuição das variáveis")
 
-        base = alt.Chart(corr).encode(
-            x=alt.X(
-                "var_x:N",
-                title=None,
-                sort=variaveis[:-1],  # a última variável só aparece nas linhas
-                axis=alt.Axis(labelAngle=0, labelFontSize=14),
-            ),
-            y=alt.Y("var_y:N", title=None, sort=variaveis[1:], axis=alt.Axis(labelFontSize=14)),  # a primeira só nas colunas
-        )
-        heatmap = base.mark_rect().encode(
-            color=alt.Color(
-                "correlacao:Q",
-                title="Spearman",
-                scale=alt.Scale(scheme="redblue", domain=[-1, 1], reverse=True),
-                legend=alt.Legend(titleFontSize=14, labelFontSize=13),
-            ),
-            tooltip=["var_x", "var_y", alt.Tooltip("correlacao:Q", format=".2f")],
-        )
-        valores = base.mark_text(fontSize=16).encode(
-            text=alt.Text("correlacao:Q", format=".2f"),
-            color=alt.condition(
-                "abs(datum.correlacao) > 0.5", alt.value("white"), alt.value("black")
-            ),
-        )
-
-        st.altair_chart(
-            (heatmap + valores).properties(height=380),
-            width="stretch",
-            alt="Mapa de calor (triângulo inferior, sem a diagonal) da correlação de Spearman entre as variáveis quantitativas selecionadas",
-        )
-
-with col_distribuicao:
-    st.subheader("Distribuição")
-
-    if not variaveis:
-        st.warning("Selecione pelo menos 1 variável para ver a distribuição.")
+    # Tratamento de situações em que não há dados para desenhar o gráfico.
+    if not variaveis_selecionadas:
+        st.info("Selecione ao menos uma variável na barra lateral.")
     elif df_filtrado.empty:
-        st.warning("Nenhum paciente dentro dos intervalos escolhidos.")
+        st.warning("Nenhum registro corresponde aos intervalos selecionados.")
     else:
-        # Com número par de variáveis não sobra espaço na grade: a legenda vai acima dela
-        if separar_por_classe and len(variaveis) % 2 == 0:
-            st.markdown(LEGENDA_CLASSE)
+        # A grade terá três gráficos por linha. `ceil` arredonda o resultado
+        # para cima: por exemplo, 4 gráficos precisam de 2 linhas.
+        numero_colunas = 3
+        numero_linhas = math.ceil(len(variaveis_selecionadas) / numero_colunas)
 
-        # Um histograma por variável selecionada, em grade de 2 colunas (cada um com a sua escala)
-        for inicio in range(0, len(variaveis), 2):
-            colunas = st.columns(2)
-            for coluna, var in zip(colunas, variaveis[inicio : inicio + 2]):
-                histograma = (
-                    alt.Chart(df_filtrado[[var, "doenca_cardiaca"]])
-                    .mark_bar()
-                    .encode(
-                        x=alt.X(f"{var}:Q", bin=alt.Bin(maxbins=20), title=var),
-                        y=alt.Y("count()", title="Pacientes"),
-                        tooltip=[alt.Tooltip("count()", title="Pacientes")],
-                    )
-                    .properties(height=200)
-                )
-                if separar_por_classe:
-                    histograma = histograma.encode(
-                        color=alt.Color(
-                            "doenca_cardiaca:N",
-                            title="Classe",
-                            scale=CORES_CLASSE,
-                            legend=None,
-                        ),
-                        tooltip=["doenca_cardiaca", alt.Tooltip("count()", title="Pacientes")],
-                    )
-                else:
-                    histograma = histograma.mark_bar(color=COR_HISTOGRAMA)
+        # `make_subplots` cria uma figura contendo vários espaços para gráficos.
+        # `subplot_titles` fornece um título para cada espaço; os espaçamentos
+        # são reduzidos para caber melhor na página, especialmente com muitas linhas.
+        figura_histogramas = make_subplots(
+            rows=numero_linhas,
+            cols=numero_colunas,
+            subplot_titles=variaveis_selecionadas,
+            vertical_spacing=min(0.08, 0.4 / numero_linhas),
+            horizontal_spacing=0.08,
+        )
 
-                with coluna:
-                    st.altair_chart(histograma, width="stretch", alt=f"Histograma da variável {var}")
+        # `enumerate` percorre a lista e fornece tanto a posição (`indice`)
+        # quanto o nome da variável. Usamos a posição para calcular em qual
+        # linha e coluna da grade cada histograma deve ser colocado.
+        for indice, variavel in enumerate(variaveis_selecionadas):
+            # Divisão inteira (`//`) indica a linha da grade; resto (`%`)
+            # indica a coluna. Somamos 1 porque Plotly numera linhas/colunas a partir de 1.
+            linha = indice // numero_colunas + 1
+            coluna = indice % numero_colunas + 1
 
-            # Número ímpar de variáveis: a legenda ocupa o espaço que sobrou na última linha
-            if separar_por_classe and len(colunas) == 2 and len(variaveis[inicio : inicio + 2]) == 1:
-                colunas[1].markdown(LEGENDA_CLASSE)
+            # `go.Histogram` descreve um histograma Plotly.
+            # `x` recebe os valores da variável; `dropna()` remove valores ausentes.
+            # `nbinsx` sugere até 20 faixas para agrupar os valores.
+            figura_histogramas.add_trace(
+                go.Histogram(
+                    x=df_filtrado[variavel].dropna(),
+                    nbinsx=20,
+                    marker_color="#4C78A8",
+                    hovertemplate="Faixa: %{x}<br>Frequência: %{y}<extra></extra>",
+                    showlegend=False,
+                ),
+                # `add_trace` adiciona o histograma à posição correspondente na grade.
+                row=linha,
+                col=coluna,
+            )
+            # Define os nomes dos eixos de cada gráfico individual.
+            figura_histogramas.update_xaxes(title_text=variavel, row=linha, col=coluna)
+            figura_histogramas.update_yaxes(title_text="Frequência", row=linha, col=coluna)
 
-# TODO: Dashboard 2 — KPIs (Aula 22)
+        # Ajustes visuais da figura inteira: altura cresce conforme o número
+        # de linhas, `bargap` controla o espaço entre barras e `margin` as bordas.
+        figura_histogramas.update_layout(
+            height=max(360, numero_linhas * 240),
+            bargap=0.08,
+            template="plotly_white",
+            margin=dict(l=20, r=20, t=55, b=20),
+        )
+        # Exibe a figura Plotly no Streamlit. `width="stretch"` faz o gráfico
+        # ocupar a largura disponível; `alt` descreve o gráfico para acessibilidade.
+        st.plotly_chart(
+            figura_histogramas,
+            width="stretch",
+            alt="Matriz de histogramas das variáveis selecionadas",
+        )
+
+# Heatmap (mapa de calor) da correlação de Pearson: cada célula representa
+# a associação linear entre um par de variáveis. A correlação varia de -1 a 1:
+# valores próximos de 1 indicam associação positiva, próximos de -1 negativa,
+# e próximos de 0 pouca associação linear. Correlação não prova causalidade.
+with coluna_correlacao:
+    st.subheader("Matriz de correlação")
+
+    # Correlação compara pares de colunas; por isso são necessárias duas ou mais.
+    if len(variaveis_selecionadas) < 2:
+        st.info("Selecione ao menos duas variáveis para calcular a correlação.")
+    elif df_filtrado.empty:
+        st.warning("Nenhum registro corresponde aos intervalos selecionados.")
+    else:
+        # Seleciona as colunas escolhidas e calcula a correlação de Pearson.
+        # O resultado é uma matriz quadrada: linhas e colunas são as variáveis.
+        # Valores ausentes são tratados pelo pandas durante o cálculo por pares.
+        matriz_correlacao = df_filtrado[variaveis_selecionadas].corr(method="pearson")
+
+        # Prepara textos para mostrar dentro das células do mapa.
+        # `to_numpy()` transforma a matriz do pandas em uma matriz NumPy;
+        # `:.2f` formata cada número com duas casas decimais.
+        # Se o valor não existir (por exemplo, coluna constante), mostra "n/a".
+        rotulos = [
+            [
+                f"{valor:.2f}" if pd.notna(valor) else "n/a"
+                for valor in linha
+            ]
+            for linha in matriz_correlacao.to_numpy()
+        ]
+
+        # `go.Heatmap` constrói o mapa de calor:
+        # `z` são os valores numéricos e `x`/`y` são os nomes dos eixos.
+        # `zmin` e `zmax` mantêm a escala comparável entre -1 e 1.
+        figura_correlacao = go.Figure(
+            data=go.Heatmap(
+                z=matriz_correlacao.to_numpy(),
+                x=variaveis_selecionadas,
+                y=variaveis_selecionadas,
+                text=rotulos,
+                texttemplate="%{text}",
+                colorscale="RdBu",
+                zmin=-1,
+                zmax=1,
+                colorbar=dict(title="Pearson"),
+                hovertemplate=(
+                    # Texto exibido quando o cursor passa sobre uma célula.
+                    # %{x}, %{y} e %{z} são substituídos pelos valores do gráfico.
+                    "Variável X: %{x}<br>Variável Y: %{y}"
+                    "<br>Correlação: %{z:.2f}<extra></extra>"
+                ),
+            )
+        )
+
+        # Ajusta dimensões e apresentação do mapa. A altura aumenta com a
+        # quantidade de variáveis, e o ângulo dos rótulos evita sobreposição.
+        figura_correlacao.update_layout(
+            height=max(420, len(variaveis_selecionadas) * 38),
+            template="plotly_white",
+            margin=dict(l=20, r=20, t=25, b=110),
+            xaxis=dict(tickangle=-45),
+            yaxis=dict(autorange="reversed"),
+        )
+
+        # Apresenta a matriz de correlação interativa na coluna da direita.
+        st.plotly_chart(
+            figura_correlacao,
+            width="stretch",
+            alt="Mapa de calor da correlação de Pearson entre as variáveis selecionadas",
+        )
