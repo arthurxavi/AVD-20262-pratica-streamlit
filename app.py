@@ -1,18 +1,14 @@
-# `math` fornece funções matemáticas; aqui usamos `ceil` para arredondar
-# para cima a quantidade de linhas necessárias na grade de histogramas.
-import math
+from datetime import date
 
 # `pandas` manipula dados tabulares (DataFrames), como o CSV deste projeto.
 import pandas as pd
 
-# `graph_objects` permite montar gráficos Plotly configurando cada elemento.
-import plotly.graph_objects as go
+# `altair` cria gráficos declarativos: descrevemos os dados e os canais visuais
+# (eixos, cores e textos), e a biblioteca monta a visualização.
+import altair as alt
 
 # `streamlit` fornece os componentes da página, os filtros e a exibição dos gráficos.
 import streamlit as st
-
-# `make_subplots` cria uma figura com vários gráficos menores organizados em grade.
-from plotly.subplots import make_subplots
 
 # Função do projeto que lê o CSV e o devolve como um DataFrame do pandas.
 from src.data_loader import load_data
@@ -45,6 +41,260 @@ VARIAVEIS = [
     "congestion_log",
 ]
 
+# `st.cache_data` guarda em cache o resultado da função. Se ela for chamada de
+# novo com os mesmos argumentos, Streamlit reutiliza o gráfico em vez de criá-lo
+# outra vez. O DataFrame e o nome da variável fazem parte da chave do cache.
+@st.cache_data(show_spinner=False)
+def criar_histograma(df_variavel: pd.DataFrame, variavel: str) -> alt.Chart:
+    """Cria um histograma Altair para uma variável numérica."""
+    return (
+        alt.Chart(df_variavel)
+        .mark_bar(color="#4C78A8")
+        .encode(
+            # `bin` agrupa valores contínuos em até 20 faixas; `count()` conta
+            # quantas linhas caem em cada faixa e forma a altura das barras.
+            x=alt.X(
+                f"{variavel}:Q",
+                bin=alt.Bin(maxbins=20),
+                title=variavel,
+            ),
+            y=alt.Y("count():Q", title="Frequência"),
+            tooltip=[
+                alt.Tooltip(
+                    f"{variavel}:Q",
+                    bin=alt.Bin(maxbins=20),
+                    title="Faixa",
+                ),
+                alt.Tooltip("count():Q", title="Frequência"),
+            ],
+        )
+        .properties(height=180, title=variavel)
+    )
+
+
+# Também armazenamos em cache o cálculo de correlação e a especificação Altair.
+# O argumento com as colunas selecionadas limita os dados usados nesta função.
+@st.cache_data(show_spinner=False)
+def criar_mapa_correlacao(
+    df_variaveis: pd.DataFrame, variaveis: tuple[str, ...]
+) -> alt.LayerChart:
+    """Calcula a correlação de Pearson e cria um heatmap Altair."""
+    matriz = df_variaveis[list(variaveis)].corr(method="pearson")
+
+    # Converte a matriz quadrada em tabela longa: cada linha passa a representar
+    # uma célula do heatmap, com o nome das duas variáveis e sua correlação.
+    dados = (
+        matriz.rename_axis(index="variavel_y", columns="variavel_x")
+        .reset_index()
+        .melt(
+            id_vars="variavel_y",
+            var_name="variavel_x",
+            value_name="correlacao",
+        )
+    )
+    # Mantém "n/a" visível para pares em que a correlação não pode ser calculada,
+    # por exemplo, quando uma das colunas tem o mesmo valor em todas as linhas.
+    dados["rotulo"] = dados["correlacao"].map(
+        lambda valor: f"{valor:.2f}" if pd.notna(valor) else "n/a"
+    )
+
+    # A lista `variaveis` preserva a ordem escolhida na barra lateral nos eixos.
+    base = alt.Chart(dados).encode(
+        x=alt.X(
+            "variavel_x:N",
+            title=None,
+            sort=list(variaveis),
+            axis=alt.Axis(labelAngle=-45),
+        ),
+        y=alt.Y("variavel_y:N", title=None, sort=list(variaveis)),
+        tooltip=[
+            alt.Tooltip("variavel_x:N", title="Variável X"),
+            alt.Tooltip("variavel_y:N", title="Variável Y"),
+            alt.Tooltip("correlacao:Q", title="Pearson", format=".2f"),
+        ],
+    )
+
+    # A primeira camada desenha as células coloridas; a segunda escreve
+    # o valor numérico em cada célula para facilitar a leitura do heatmap.
+    heatmap = base.mark_rect().encode(
+        color=alt.Color(
+            "correlacao:Q",
+            title="Pearson",
+            scale=alt.Scale(scheme="redblue", domain=[-1, 1]),
+        )
+    )
+    rotulos = base.mark_text(fontSize=11).encode(text=alt.Text("rotulo:N"))
+
+    # `alt.layer` sobrepõe os textos às células. `alt.Step` define o espaço
+    # reservado por categoria, então a matriz cresce quando mais variáveis
+    # forem selecionadas.
+    return (
+        alt.layer(heatmap, rotulos)
+        .properties(
+            width=alt.Step(30),
+            height=alt.Step(30),
+        )
+        .configure_axis(labelFontSize=10)
+    )
+
+
+# Filtra o Dashboard 2 e armazena em cache o resultado para reaproveitá-lo
+# enquanto os dados e todos os filtros permanecerem iguais.
+@st.cache_data(show_spinner=False)
+def filtrar_dashboard_kpis(
+    dados: pd.DataFrame,
+    data_inicial: date,
+    data_final: date,
+    areas: tuple[str, ...],
+    prioridades: tuple[str, ...],
+    climas: tuple[str, ...],
+    severidades: tuple[str, ...],
+) -> pd.DataFrame:
+    """Deduplica e filtra as ocorrências por data e categorias."""
+    ocorrencias = dados.drop_duplicates(subset="Record_ID", keep="first")
+    mascara = ocorrencias["Date"].between(data_inicial, data_final)
+    mascara &= ocorrencias["Area_Type"].isin(areas)
+    mascara &= ocorrencias["Dispatch_Priority"].isin(prioridades)
+    mascara &= ocorrencias["Weather"].isin(climas)
+    mascara &= ocorrencias["Accident_Severity"].isin(severidades)
+    return ocorrencias.loc[mascara].copy()
+
+
+# Cada função abaixo prepara e cria uma visualização Altair interativa.
+# O DataFrame filtrado é argumento da função e, portanto, também participa
+# da chave usada por `st.cache_data`.
+@st.cache_data(show_spinner=False)
+def criar_histograma_resposta(dados: pd.DataFrame) -> alt.Chart:
+    """Mostra a frequência de ocorrências por faixa de tempo real de resposta."""
+    return (
+        alt.Chart(dados)
+        .mark_bar(color="#4C78A8")
+        .encode(
+            x=alt.X(
+                "Actual_Response_Time_min:Q",
+                bin=alt.Bin(maxbins=20),
+                title="Tempo real de resposta (minutos)",
+            ),
+            y=alt.Y("count():Q", title="Quantidade de ocorrências"),
+            tooltip=[
+                alt.Tooltip(
+                    "Actual_Response_Time_min:Q",
+                    bin=alt.Bin(maxbins=20),
+                    title="Faixa de resposta (min)",
+                ),
+                alt.Tooltip("count():Q", title="Ocorrências"),
+            ],
+        )
+        .properties(height=300)
+        .interactive()
+    )
+
+
+@st.cache_data(show_spinner=False)
+def criar_scatter_resposta(dados: pd.DataFrame) -> alt.Chart:
+    """Compara o tempo esperado com o tempo real de resposta."""
+    return (
+        alt.Chart(dados)
+        .mark_circle(size=55, opacity=0.55)
+        .encode(
+            x=alt.X(
+                "Baseline_Expected_Response_Time_min:Q",
+                title="Tempo esperado (minutos)",
+            ),
+            y=alt.Y(
+                "Actual_Response_Time_min:Q",
+                title="Tempo real de resposta (minutos)",
+            ),
+            color=alt.Color("Area_Type:N", title="Tipo de área"),
+            tooltip=[
+                alt.Tooltip("Record_ID:N", title="Registro"),
+                alt.Tooltip("Date:T", title="Data", format="%d/%m/%Y"),
+                alt.Tooltip("Area_Type:N", title="Área"),
+                alt.Tooltip("Dispatch_Priority:N", title="Prioridade"),
+                alt.Tooltip(
+                    "Baseline_Expected_Response_Time_min:Q",
+                    title="Tempo esperado (min)",
+                    format=".1f",
+                ),
+                alt.Tooltip(
+                    "Actual_Response_Time_min:Q",
+                    title="Tempo real (min)",
+                    format=".1f",
+                ),
+            ],
+        )
+        .properties(height=300)
+        .interactive()
+    )
+
+
+@st.cache_data(show_spinner=False)
+def criar_grafico_area(dados: pd.DataFrame) -> alt.Chart:
+    """Mostra a participação percentual das ocorrências por tipo de área."""
+    contagem = (
+        dados.groupby("Area_Type", as_index=False)
+        .agg(ocorrencias=("Record_ID", "nunique"))
+    )
+    contagem["percentual"] = (
+        contagem["ocorrencias"] / contagem["ocorrencias"].sum() * 100
+    )
+
+    # Clicar na legenda destaca a área correspondente e reduz a opacidade das
+    # demais fatias; o tooltip mostra contagem e percentual exatos.
+    selecao_area = alt.selection_point(fields=["Area_Type"], bind="legend")
+    return (
+        alt.Chart(contagem)
+        .mark_arc(outerRadius=115)
+        .encode(
+            theta=alt.Theta("ocorrencias:Q", title="Ocorrências"),
+            color=alt.Color("Area_Type:N", title="Tipo de área"),
+            opacity=alt.condition(
+                selecao_area,
+                alt.value(1),
+                alt.value(0.3),
+            ),
+            tooltip=[
+                alt.Tooltip("Area_Type:N", title="Área"),
+                alt.Tooltip("ocorrencias:Q", title="Ocorrências"),
+                alt.Tooltip("percentual:Q", title="Participação", format=".1f"),
+            ],
+        )
+        .add_params(selecao_area)
+        .properties(height=300)
+    )
+
+
+@st.cache_data(show_spinner=False)
+def criar_grafico_horario(dados: pd.DataFrame) -> alt.Chart:
+    """Mostra a quantidade de ocorrências em cada hora, de 0 a 23."""
+    contagem = (
+        dados.groupby("Hour")
+        .agg(ocorrencias=("Record_ID", "nunique"))
+        .reindex(range(24), fill_value=0)
+        .rename_axis("Hour")
+        .reset_index()
+    )
+    return (
+        alt.Chart(contagem)
+        .mark_bar(color="#4C78A8")
+        .encode(
+            x=alt.X(
+                "Hour:O",
+                title="Hora do dia",
+                sort=list(range(24)),
+                axis=alt.Axis(labelAngle=0),
+            ),
+            y=alt.Y("ocorrencias:Q", title="Quantidade de ocorrências"),
+            tooltip=[
+                alt.Tooltip("Hour:O", title="Hora"),
+                alt.Tooltip("ocorrencias:Q", title="Ocorrências"),
+            ],
+        )
+        .properties(height=300)
+        .interactive()
+    )
+
+
 # Carrega os dados. No `data_loader.py`, `load_data()` usa `pandas.read_csv`
 # para abrir `data/clean/dataset.csv` e retornar o conteúdo como DataFrame.
 df = load_data()
@@ -52,7 +302,21 @@ df = load_data()
 # Primeiro, verifica se todas as colunas pedidas existem no DataFrame.
 # A expressão `x not in df.columns` testa se o nome da coluna está ausente;
 # a compreensão de lista reúne todos os nomes ausentes em uma nova lista.
-colunas_ausentes = [variavel for variavel in VARIAVEIS if variavel not in df.columns]
+COLUNAS_DASHBOARD_KPIS = [
+    "Record_ID",
+    "Date",
+    "Area_Type",
+    "Dispatch_Priority",
+    "Weather",
+    "Accident_Severity",
+    "Actual_Response_Time_min",
+    "Baseline_Expected_Response_Time_min",
+    "Road_Closure_Duration_min",
+]
+colunas_necessarias = list(dict.fromkeys(VARIAVEIS + COLUNAS_DASHBOARD_KPIS))
+colunas_ausentes = [
+    variavel for variavel in colunas_necessarias if variavel not in df.columns
+]
 if colunas_ausentes:
     # `st.error` mostra um aviso de erro no app e `st.stop` interrompe a execução
     # deste rerun para evitar que o restante do código use colunas inexistentes.
@@ -74,237 +338,296 @@ if colunas_nao_numericas:
     )
     st.stop()
 
-# Título e texto de orientação na área principal do dashboard.
-st.title("Análise de acidentes de trânsito")
-st.caption(
-    "Explore a distribuição das variáveis e a correlação entre elas. "
-    "Use os filtros na barra lateral para definir a análise."
+# Padroniza strings categóricas para que valores como "RAIN" e " Rain " não
+# apareçam como opções diferentes nos filtros do Dashboard 2.
+for coluna in ["Area_Type", "Dispatch_Priority", "Weather", "Accident_Severity"]:
+    df[coluna] = df[coluna].astype("string").str.strip().str.title()
+
+# Converte datas textuais para `datetime.date`, necessário para o intervalo
+# selecionável e para a comparação de datas no filtro.
+df["Date"] = pd.to_datetime(df["Date"], errors="raise").dt.date
+
+# Duas abas separam os painéis: a primeira mantém o dashboard existente e a
+# segunda contém o novo painel de métricas e análises.
+aba_dashboard1, aba_dashboard2 = st.tabs(
+    ["Dashboard 1 · Distribuição e correlação", "Dashboard 2 · Indicadores"]
 )
 
-# O bloco `with st.sidebar` coloca todos os elementos indentados na barra lateral.
-# Ao alterar um widget, o Streamlit executa o script novamente e atualiza os gráficos.
-with st.sidebar:
-    st.header("Filtros")
-
-    # `st.multiselect` permite escolher zero, uma ou várias opções.
-    # `options` define as escolhas possíveis; `default` marca inicialmente
-    # todas as variáveis como selecionadas.
-    variaveis_selecionadas = st.multiselect(
-        "Variáveis para análise",
-        options=VARIAVEIS,
-        default=VARIAVEIS,
-        help="As variáveis selecionadas aparecem nos histogramas e no mapa de correlação.",
+# ---------------------------------------------------------------------------
+# Aba 1: dashboard atual de histogramas e matriz de correlação.
+# ---------------------------------------------------------------------------
+with aba_dashboard1:
+    st.title("Análise de acidentes de trânsito")
+    st.caption(
+        "Explore a distribuição das variáveis e a correlação entre elas. "
+        "Use os filtros ao lado para definir a análise."
     )
 
-    # Dicionário para guardar cada intervalo escolhido no formato
-    # {nome_da_coluna: (limite_inicial, limite_final)}.
-    intervalos = {}
-    if variaveis_selecionadas:
-        st.subheader("Intervalos")
-        for variavel in variaveis_selecionadas:
-            # `dropna()` cria uma série sem valores ausentes (NaN).
-            # Isso evita tentar calcular os limites usando valores vazios.
-            valores_validos = df[variavel].dropna()
-            if valores_validos.empty:
-                st.warning(f"A variável {variavel} não possui valores disponíveis.")
-                continue
+    # Os filtros ficam em uma coluna própria desta aba, mantendo o painel
+    # independente dos controles do novo dashboard.
+    coluna_filtros, coluna_graficos = st.columns([1, 3.5])
+    with coluna_filtros:
+        st.subheader("Filtros")
+        variaveis_selecionadas = st.multiselect(
+            "Variáveis para análise",
+            options=VARIAVEIS,
+            default=VARIAVEIS,
+            help="As variáveis selecionadas aparecem nos histogramas e no mapa de correlação.",
+            key="dashboard1_variaveis",
+        )
 
-            # `min()` e `max()` encontram os extremos observados da coluna.
-            minimo = valores_validos.min()
-            maximo = valores_validos.max()
+        intervalos = {}
+        if variaveis_selecionadas:
+            st.markdown("**Intervalos**")
+            for variavel in variaveis_selecionadas:
+                valores_validos = df[variavel].dropna()
+                if valores_validos.empty:
+                    st.warning(f"A variável {variavel} não possui valores disponíveis.")
+                    continue
 
-            # Se todos os registros têm o mesmo valor, não há faixa para escolher.
-            # Guardamos o próprio valor como intervalo para manter o filtro consistente.
-            if minimo == maximo:
-                st.caption(f"{variavel}: valor fixo {minimo}")
-                intervalos[variavel] = (minimo, maximo)
-            # `is_integer_dtype` verifica se a coluna usa números inteiros.
-            # Nesse caso, o controle deslizante avança de um número inteiro por vez.
-            elif pd.api.types.is_integer_dtype(df[variavel]):
-                # `st.slider` cria um controle de faixa quando `value` recebe
-                # uma tupla (menor, maior). O usuário escolhe os dois limites.
-                intervalos[variavel] = st.slider(
-                    variavel,
-                    min_value=int(minimo),
-                    max_value=int(maximo),
-                    value=(int(minimo), int(maximo)),
-                    step=1,
-                    key=f"intervalo_{variavel}",
-                )
+                minimo = valores_validos.min()
+                maximo = valores_validos.max()
+                if minimo == maximo:
+                    st.caption(f"{variavel}: valor fixo {minimo}")
+                    intervalos[variavel] = (minimo, maximo)
+                elif pd.api.types.is_integer_dtype(df[variavel]):
+                    intervalos[variavel] = st.slider(
+                        variavel,
+                        min_value=int(minimo),
+                        max_value=int(maximo),
+                        value=(int(minimo), int(maximo)),
+                        step=1,
+                        key=f"dashboard1_intervalo_{variavel}",
+                    )
+                else:
+                    minimo_float = float(minimo)
+                    maximo_float = float(maximo)
+                    intervalos[variavel] = st.slider(
+                        variavel,
+                        min_value=minimo_float,
+                        max_value=maximo_float,
+                        value=(minimo_float, maximo_float),
+                        step=max((maximo_float - minimo_float) / 100, 0.01),
+                        key=f"dashboard1_intervalo_{variavel}",
+                    )
+
+    # Todos os intervalos selecionados são aplicados em conjunto.
+    df_filtrado = df.copy()
+    for variavel, (inicio, fim) in intervalos.items():
+        df_filtrado = df_filtrado[df_filtrado[variavel].between(inicio, fim)]
+
+    with coluna_graficos:
+        st.caption(
+            f"{len(df_filtrado):,} de {len(df):,} registros dentro dos intervalos selecionados."
+        )
+        coluna_distribuicao, coluna_correlacao = st.columns([1.25, 1])
+
+        # Cada variável selecionada gera seu próprio histograma Altair.
+        with coluna_distribuicao:
+            st.subheader("Distribuição das variáveis")
+            if not variaveis_selecionadas:
+                st.info("Selecione ao menos uma variável nos filtros.")
+            elif df_filtrado.empty:
+                st.warning("Nenhum registro corresponde aos intervalos selecionados.")
             else:
-                # Para dados decimais, convertemos os limites para `float`.
-                # A variável `passo` define o tamanho dos incrementos do slider:
-                # aproximadamente 1% da amplitude, com mínimo de 0,01.
-                minimo_float = float(minimo)
-                maximo_float = float(maximo)
-                intervalos[variavel] = st.slider(
-                    variavel,
-                    min_value=minimo_float,
-                    max_value=maximo_float,
-                    value=(minimo_float, maximo_float),
-                    step=max((maximo_float - minimo_float) / 100, 0.01),
-                    key=f"intervalo_{variavel}",
+                numero_colunas = 3
+                colunas_histogramas = st.columns(numero_colunas)
+                for indice, variavel in enumerate(variaveis_selecionadas):
+                    grafico = criar_histograma(
+                        df_filtrado[[variavel]].dropna(),
+                        variavel,
+                    )
+                    colunas_histogramas[indice % numero_colunas].altair_chart(
+                        grafico,
+                        width="stretch",
+                        alt=f"Distribuição da variável {variavel}",
+                    )
+
+        # Heatmap Altair da correlação de Pearson entre variáveis selecionadas.
+        with coluna_correlacao:
+            st.subheader("Matriz de correlação")
+            if len(variaveis_selecionadas) < 2:
+                st.info("Selecione ao menos duas variáveis para calcular a correlação.")
+            elif df_filtrado.empty:
+                st.warning("Nenhum registro corresponde aos intervalos selecionados.")
+            else:
+                figura_correlacao = criar_mapa_correlacao(
+                    df_filtrado[variaveis_selecionadas],
+                    tuple(variaveis_selecionadas),
+                )
+                st.altair_chart(
+                    figura_correlacao,
+                    width="stretch",
+                    alt="Mapa de calor da correlação de Pearson entre as variáveis selecionadas",
                 )
 
-# Aplica os filtros aos dados antes de desenhar os gráficos.
-# `copy()` cria uma cópia do DataFrame original para que os filtros não alterem `df`.
-df_filtrado = df.copy()
+# ---------------------------------------------------------------------------
+# Aba 2: KPIs e gráficos do rascunho do Dashboard 2.
+# ---------------------------------------------------------------------------
+with aba_dashboard2:
+    st.title("Indicadores de ocorrências de trânsito")
+    st.caption(
+        "Use os filtros à esquerda para atualizar as métricas e os gráficos."
+    )
 
-# `intervalos.items()` percorre os pares (nome da coluna, faixa escolhida).
-# `between(inicio, fim)` retorna True para cada linha cujo valor está na faixa,
-# incluindo os extremos. Usamos essa sequência de True/False para manter as linhas
-# correspondentes no DataFrame.
-for variavel, (inicio, fim) in intervalos.items():
-    df_filtrado = df_filtrado[df_filtrado[variavel].between(inicio, fim)]
-
-# `len()` conta as linhas. `:,` no texto formata a contagem com separador
-# de milhar, facilitando a leitura de números grandes.
-st.caption(
-    f"{len(df_filtrado):,} de {len(df):,} registros dentro dos intervalos selecionados."
-)
-
-# `st.columns` divide a área principal em colunas. Os valores [1.25, 1]
-# definem a proporção de largura: a área de histogramas fica um pouco maior.
-coluna_distribuicao, coluna_correlacao = st.columns([1.25, 1])
-
-# Matriz de histogramas: cada histograma agrupa os valores em faixas (bins)
-# e conta quantos registros caem em cada faixa, mostrando a distribuição.
-# `with coluna_distribuicao` direciona os componentes seguintes para essa coluna.
-with coluna_distribuicao:
-    st.subheader("Distribuição das variáveis")
-
-    # Tratamento de situações em que não há dados para desenhar o gráfico.
-    if not variaveis_selecionadas:
-        st.info("Selecione ao menos uma variável na barra lateral.")
-    elif df_filtrado.empty:
-        st.warning("Nenhum registro corresponde aos intervalos selecionados.")
-    else:
-        # A grade terá três gráficos por linha. `ceil` arredonda o resultado
-        # para cima: por exemplo, 4 gráficos precisam de 2 linhas.
-        numero_colunas = 3
-        numero_linhas = math.ceil(len(variaveis_selecionadas) / numero_colunas)
-
-        # `make_subplots` cria uma figura contendo vários espaços para gráficos.
-        # `subplot_titles` fornece um título para cada espaço; os espaçamentos
-        # são reduzidos para caber melhor na página, especialmente com muitas linhas.
-        figura_histogramas = make_subplots(
-            rows=numero_linhas,
-            cols=numero_colunas,
-            subplot_titles=variaveis_selecionadas,
-            vertical_spacing=min(0.08, 0.4 / numero_linhas),
-            horizontal_spacing=0.08,
+    coluna_filtros_kpi, coluna_conteudo_kpi = st.columns([1, 3.5])
+    with coluna_filtros_kpi:
+        st.subheader("Widgets de controle")
+        menor_data = min(df["Date"])
+        maior_data = max(df["Date"])
+        periodo = st.date_input(
+            "Data (intervalo)",
+            value=(menor_data, maior_data),
+            min_value=menor_data,
+            max_value=maior_data,
+            format="DD/MM/YYYY",
+            key="dashboard2_periodo",
         )
 
-        # `enumerate` percorre a lista e fornece tanto a posição (`indice`)
-        # quanto o nome da variável. Usamos a posição para calcular em qual
-        # linha e coluna da grade cada histograma deve ser colocado.
-        for indice, variavel in enumerate(variaveis_selecionadas):
-            # Divisão inteira (`//`) indica a linha da grade; resto (`%`)
-            # indica a coluna. Somamos 1 porque Plotly numera linhas/colunas a partir de 1.
-            linha = indice // numero_colunas + 1
-            coluna = indice % numero_colunas + 1
+        # O controle permite selecionar qualquer subconjunto das categorias.
+        areas_disponiveis = sorted(df["Area_Type"].dropna().unique().tolist())
+        areas_selecionadas = st.multiselect(
+            "Area_Type",
+            options=areas_disponiveis,
+            default=areas_disponiveis,
+            key="dashboard2_areas",
+        )
+        prioridades_disponiveis = sorted(
+            df["Dispatch_Priority"].dropna().unique().tolist()
+        )
+        prioridades_selecionadas = st.multiselect(
+            "Dispatch_Priority",
+            options=prioridades_disponiveis,
+            default=prioridades_disponiveis,
+            key="dashboard2_prioridades",
+        )
+        climas_disponiveis = sorted(df["Weather"].dropna().unique().tolist())
+        climas_selecionados = st.multiselect(
+            "Weather",
+            options=climas_disponiveis,
+            default=climas_disponiveis,
+            key="dashboard2_climas",
+        )
+        severidades_disponiveis = sorted(
+            df["Accident_Severity"].dropna().unique().tolist()
+        )
+        severidades_selecionadas = st.multiselect(
+            "Accident_Severity",
+            options=severidades_disponiveis,
+            default=severidades_disponiveis,
+            key="dashboard2_severidades",
+        )
 
-            # `go.Histogram` descreve um histograma Plotly.
-            # `x` recebe os valores da variável; `dropna()` remove valores ausentes.
-            # `nbinsx` sugere até 20 faixas para agrupar os valores.
-            figura_histogramas.add_trace(
-                go.Histogram(
-                    x=df_filtrado[variavel].dropna(),
-                    nbinsx=20,
-                    marker_color="#4C78A8",
-                    hovertemplate="Faixa: %{x}<br>Frequência: %{y}<extra></extra>",
-                    showlegend=False,
-                ),
-                # `add_trace` adiciona o histograma à posição correspondente na grade.
-                row=linha,
-                col=coluna,
+    with coluna_conteudo_kpi:
+        if not isinstance(periodo, tuple) or len(periodo) != 2:
+            st.info("Selecione uma data inicial e uma data final para o período.")
+            st.stop()
+
+        data_inicial, data_final = periodo
+        if data_inicial > data_final:
+            st.warning("A data inicial deve ser anterior à data final.")
+            st.stop()
+
+        df_dashboard2 = filtrar_dashboard_kpis(
+            df,
+            data_inicial,
+            data_final,
+            tuple(areas_selecionadas),
+            tuple(prioridades_selecionadas),
+            tuple(climas_selecionados),
+            tuple(severidades_selecionadas),
+        )
+        total_ocorrencias = df_dashboard2["Record_ID"].nunique()
+        if total_ocorrencias:
+            tempo_medio_resposta = df_dashboard2["Actual_Response_Time_min"].mean()
+            desvio_medio_meta = (
+                df_dashboard2["Actual_Response_Time_min"]
+                - df_dashboard2["Baseline_Expected_Response_Time_min"]
+            ).mean()
+            taxa_criticos = (
+                df_dashboard2["Accident_Severity"].isin(["Severe", "Fatal"]).mean()
+                * 100
             )
-            # Define os nomes dos eixos de cada gráfico individual.
-            figura_histogramas.update_xaxes(title_text=variavel, row=linha, col=coluna)
-            figura_histogramas.update_yaxes(title_text="Frequência", row=linha, col=coluna)
+            tempo_medio_interdicao = df_dashboard2["Road_Closure_Duration_min"].mean()
+            valor_tempo_resposta = f"{tempo_medio_resposta:.1f} min"
+            valor_desvio_meta = f"{desvio_medio_meta:+.1f} min"
+            valor_taxa_criticos = f"{taxa_criticos:.1f}%"
+            valor_tempo_interdicao = f"{tempo_medio_interdicao:.1f} min"
+        else:
+            valor_tempo_resposta = "—"
+            valor_desvio_meta = "—"
+            valor_taxa_criticos = "—"
+            valor_tempo_interdicao = "—"
 
-        # Ajustes visuais da figura inteira: altura cresce conforme o número
-        # de linhas, `bargap` controla o espaço entre barras e `margin` as bordas.
-        figura_histogramas.update_layout(
-            height=max(360, numero_linhas * 240),
-            bargap=0.08,
-            template="plotly_white",
-            margin=dict(l=20, r=20, t=55, b=20),
-        )
-        # Exibe a figura Plotly no Streamlit. `width="stretch"` faz o gráfico
-        # ocupar a largura disponível; `alt` descreve o gráfico para acessibilidade.
-        st.plotly_chart(
-            figura_histogramas,
-            width="stretch",
-            alt="Matriz de histogramas das variáveis selecionadas",
+        st.caption(
+            f"{total_ocorrencias:,} ocorrências encontradas com os filtros selecionados."
         )
 
-# Heatmap (mapa de calor) da correlação de Pearson: cada célula representa
-# a associação linear entre um par de variáveis. A correlação varia de -1 a 1:
-# valores próximos de 1 indicam associação positiva, próximos de -1 negativa,
-# e próximos de 0 pouca associação linear. Correlação não prova causalidade.
-with coluna_correlacao:
-    st.subheader("Matriz de correlação")
-
-    # Correlação compara pares de colunas; por isso são necessárias duas ou mais.
-    if len(variaveis_selecionadas) < 2:
-        st.info("Selecione ao menos duas variáveis para calcular a correlação.")
-    elif df_filtrado.empty:
-        st.warning("Nenhum registro corresponde aos intervalos selecionados.")
-    else:
-        # Seleciona as colunas escolhidas e calcula a correlação de Pearson.
-        # O resultado é uma matriz quadrada: linhas e colunas são as variáveis.
-        # Valores ausentes são tratados pelo pandas durante o cálculo por pares.
-        matriz_correlacao = df_filtrado[variaveis_selecionadas].corr(method="pearson")
-
-        # Prepara textos para mostrar dentro das células do mapa.
-        # `to_numpy()` transforma a matriz do pandas em uma matriz NumPy;
-        # `:.2f` formata cada número com duas casas decimais.
-        # Se o valor não existir (por exemplo, coluna constante), mostra "n/a".
-        rotulos = [
-            [
-                f"{valor:.2f}" if pd.notna(valor) else "n/a"
-                for valor in linha
-            ]
-            for linha in matriz_correlacao.to_numpy()
-        ]
-
-        # `go.Heatmap` constrói o mapa de calor:
-        # `z` são os valores numéricos e `x`/`y` são os nomes dos eixos.
-        # `zmin` e `zmax` mantêm a escala comparável entre -1 e 1.
-        figura_correlacao = go.Figure(
-            data=go.Heatmap(
-                z=matriz_correlacao.to_numpy(),
-                x=variaveis_selecionadas,
-                y=variaveis_selecionadas,
-                text=rotulos,
-                texttemplate="%{text}",
-                colorscale="RdBu",
-                zmin=-1,
-                zmax=1,
-                colorbar=dict(title="Pearson"),
-                hovertemplate=(
-                    # Texto exibido quando o cursor passa sobre uma célula.
-                    # %{x}, %{y} e %{z} são substituídos pelos valores do gráfico.
-                    "Variável X: %{x}<br>Variável Y: %{y}"
-                    "<br>Correlação: %{z:.2f}<extra></extra>"
-                ),
-            )
+        # As cinco métricas seguem a justificativa: volume, tempo de resposta,
+        # diferença para a meta, proporção crítica e duração da interdição.
+        metricas = st.columns(5)
+        metricas[0].metric(
+            "1 · Total de ocorrências",
+            f"{total_ocorrencias:,}",
+            border=True,
+        )
+        metricas[1].metric(
+            "2 · Tempo médio de resposta",
+            valor_tempo_resposta,
+            border=True,
+        )
+        metricas[2].metric(
+            "3 · Desvio médio da meta",
+            valor_desvio_meta,
+            border=True,
+            help="Média do tempo real menos o tempo esperado. Valor positivo indica atraso em relação à meta.",
+        )
+        metricas[3].metric(
+            "4 · Taxa de chamados críticos",
+            valor_taxa_criticos,
+            border=True,
+            help="Percentual de ocorrências classificadas como Severe ou Fatal.",
+        )
+        metricas[4].metric(
+            "5 · Tempo médio de interdição",
+            valor_tempo_interdicao,
+            border=True,
         )
 
-        # Ajusta dimensões e apresentação do mapa. A altura aumenta com a
-        # quantidade de variáveis, e o ângulo dos rótulos evita sobreposição.
-        figura_correlacao.update_layout(
-            height=max(420, len(variaveis_selecionadas) * 38),
-            template="plotly_white",
-            margin=dict(l=20, r=20, t=25, b=110),
-            xaxis=dict(tickangle=-45),
-            yaxis=dict(autorange="reversed"),
-        )
+        if df_dashboard2.empty:
+            st.warning("Nenhuma ocorrência corresponde aos filtros selecionados.")
+        else:
+            # Primeira linha do rascunho: tempo de resposta e comparação
+            # entre o tempo esperado e o tempo real.
+            coluna_hist_resposta, coluna_scatter = st.columns(2)
+            with coluna_hist_resposta:
+                st.subheader("Tempo real de resposta por frequência")
+                st.altair_chart(
+                    criar_histograma_resposta(df_dashboard2),
+                    width="stretch",
+                    alt="Distribuição das ocorrências por tempo real de resposta",
+                )
+            with coluna_scatter:
+                st.subheader("Tempo esperado versus tempo real")
+                st.altair_chart(
+                    criar_scatter_resposta(df_dashboard2),
+                    width="stretch",
+                    alt="Comparação entre o tempo esperado e o tempo real de resposta",
+                )
 
-        # Apresenta a matriz de correlação interativa na coluna da direita.
-        st.plotly_chart(
-            figura_correlacao,
-            width="stretch",
-            alt="Mapa de calor da correlação de Pearson entre as variáveis selecionadas",
-        )
+            # Segunda linha do rascunho: participação por área e volume por hora.
+            coluna_pizza, coluna_horario = st.columns(2)
+            with coluna_pizza:
+                st.subheader("Ocorrências por tipo de área")
+                st.altair_chart(
+                    criar_grafico_area(df_dashboard2),
+                    width="stretch",
+                    alt="Percentual de ocorrências por tipo de área",
+                )
+            with coluna_horario:
+                st.subheader("Ocorrências por hora do dia")
+                st.altair_chart(
+                    criar_grafico_horario(df_dashboard2),
+                    width="stretch",
+                    alt="Quantidade de ocorrências em cada hora do dia",
+                )
